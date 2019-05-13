@@ -15,10 +15,14 @@ import (
 
 const retryDelay = 100 * time.Millisecond
 
+const txCharacteristic = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+const rxCharacteristic = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
 type device struct {
 	addr string
 
 	dev *btapi.Device
+	txc *btprofile.GattCharacteristic1
 	mu  sync.Mutex
 }
 
@@ -66,12 +70,8 @@ F:
 }
 
 // getCharacteristic returns the characteristic determined by the given uuid, retrying until
-// the characteristic is found or the context is cancelled. The device is connected beforehand.
+// the characteristic is found or the context is cancelled.
 func (d *device) getCharacteristic(ctx context.Context, uuid string) (*btprofile.GattCharacteristic1, error) {
-	if err := d.connect(ctx); err != nil {
-		return nil, err
-	}
-
 	t := time.NewTicker(retryDelay)
 	defer t.Stop()
 
@@ -169,7 +169,11 @@ func getChangedProperty(s *dbus.Signal, wantIface, wantProp string) (interface{}
 
 // loop reads data from the d’s UART RX characteristic until the context expires.
 func (d *device) loop(ctx context.Context) error {
-	char, err := d.getCharacteristic(ctx, "6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+	if err := d.connect(ctx); err != nil {
+		return fmt.Errorf("can't connect: %v", err)
+	}
+
+	char, err := d.getCharacteristic(ctx, rxCharacteristic)
 	if err != nil {
 		return fmt.Errorf("can't get RX characteristic: %v", err)
 	}
@@ -205,6 +209,35 @@ func (d *device) loop(ctx context.Context) error {
 
 	log.Infof("Listening for data")
 	<-ctx.Done()
+
+	return nil
+}
+
+// getTXCharacteristic retrieves the d’s UART TX characteristic if d.txc is non-nil and returns
+// it.
+func (d *device) getTXCharacteristic(ctx context.Context) (*btprofile.GattCharacteristic1, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.txc != nil {
+		return d.txc, nil
+	}
+
+	txc, err := d.getCharacteristic(ctx, txCharacteristic)
+	d.txc = txc
+	return txc, err
+}
+
+// send writes data to d’s UART TX characteristic.
+func (d *device) send(ctx context.Context, data []uint8) error {
+	char, err := d.getTXCharacteristic(ctx)
+	if err != nil {
+		return fmt.Errorf("can't get TX characteristic: %v", err)
+	}
+
+	if err := char.WriteValue(data, nil); err != nil {
+		return fmt.Errorf("can't write to TX characteristic %q: %v", txCharacteristic, err)
+	}
 
 	return nil
 }
