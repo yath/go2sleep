@@ -13,16 +13,20 @@ import (
 	btprofile "github.com/muka/go-bluetooth/bluez/profile"
 )
 
+// retryDelay is the delay before a failed connect() or getCharacteristic() is retried.
 const retryDelay = 100 * time.Millisecond
 
-const txCharacteristic = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
-const rxCharacteristic = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+// Nordic UART Service TX and RX (from client’s PoV) UUIDs.
+const (
+	txCharacteristic = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+	rxCharacteristic = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+)
 
+// device is a BLE device providing the Nordic UART service.
 type device struct {
 	addr string
 
 	dev *btapi.Device
-	txc *btprofile.GattCharacteristic1
 	mu  sync.Mutex
 }
 
@@ -41,7 +45,7 @@ func (d *device) connect(ctx context.Context) error {
 		return nil
 	}
 
-	log.Infof("Connecting to %q", d.addr)
+	log.Infof("Connecting to %q.", d.addr)
 	dev, err := btapi.GetDeviceByAddress(d.addr)
 	if err != nil {
 		return fmt.Errorf("can't get device with address %q: %v", d.addr, err)
@@ -92,26 +96,7 @@ F:
 	}
 }
 
-func handleRX(data []uint8) error {
-	log.Debugf("Received %d bytes: %#v", len(data), data)
-	if data[0] != 0x5b {
-		return fmt.Errorf("first byte not 5b: %x", data[0])
-	}
-
-	switch data[1] {
-	case 0x40: // heart_spo2
-		pi := uint8(0)
-		if len(data) > 7 {
-			pi = data[7]
-		}
-		log.Noticef("HEART_SPO2{spo2: %d, heart: %d, wear: %d, charge: %d, pi: %d}", data[3], data[4], data[5], data[6], pi)
-	case 0x15: // ble_battery
-		log.Noticef("BATTERY{level: %d}", data[3])
-	}
-	return nil
-}
-
-// unpacks assigns the elements in []in to the values pointed to by []outps. in’s and
+// unpack assigns the elements in []in to the values pointed to by []outps. in’s and
 // outps’ lengths must match, and in[i] must be assignable to *out[i].
 func unpack(in []interface{}, outps ...interface{}) error {
 	if len(in) != len(outps) {
@@ -151,7 +136,7 @@ func getChangedProperty(s *dbus.Signal, wantIface, wantProp string) (interface{}
 	var changed map[string]dbus.Variant
 	var invalidated []string
 	if err := unpack(s.Body, &iface, &changed, &invalidated); err != nil {
-		log.Errorf("can't get arguments from signal %v: %v", s, err)
+		log.Errorf("can't get arguments from signal %v: %v.", s, err)
 		return nil, false
 	}
 
@@ -167,75 +152,67 @@ func getChangedProperty(s *dbus.Signal, wantIface, wantProp string) (interface{}
 	return v.Value(), true
 }
 
-// loop reads data from the d’s UART RX characteristic until the context expires.
-func (d *device) loop(ctx context.Context) error {
-	if err := d.connect(ctx); err != nil {
-		return fmt.Errorf("can't connect: %v", err)
-	}
-
-	char, err := d.getCharacteristic(ctx, rxCharacteristic)
+// receive subscribes to d’s UART RX characteristic and returns a channel emitting the received data.
+func (d *device) receive(ctx context.Context) (<-chan []byte, error) {
+	rx, err := d.getCharacteristic(ctx, rxCharacteristic)
 	if err != nil {
-		return fmt.Errorf("can't get RX characteristic: %v", err)
+		return nil, fmt.Errorf("can't get RX characteristic: %v", err)
 	}
 
-	dc, err := char.Register()
+	sigc, err := rx.Register()
 	if err != nil {
-		return fmt.Errorf("can't register for changes: %v", err)
+		return nil, fmt.Errorf("can't register for changes: %v", err)
 	}
 
+	if err = rx.StartNotify(); err != nil {
+		return nil, fmt.Errorf("can't start notifications: %v", err)
+	}
+	log.Debugf("Started notifications for characteristic %#v.", rx)
+
+	ret := make(chan []byte, 1)
 	go func() {
-		for d := range dc {
-			val, ok := getChangedProperty(d, "org.bluez.GattCharacteristic1", "Value")
-			if !ok {
-				log.Warningf("received unknown data: %#v", d)
-				continue
-			}
+		defer func() {
+			close(ret)
+			log.Debugf("Stopping notifications for characteristic %#v.", rx)
+			warnOnError("Can't stop notifications: %v.", rx.StopNotify())
+		}()
 
-			if err := handleRX(val.([]uint8)); err != nil {
-				log.Errorf("While handling %#v: %v", val, err)
+		for {
+			select {
+			case sig := <-sigc:
+				if sig == nil {
+					return
+				}
+				val, ok := getChangedProperty(sig, "org.bluez.GattCharacteristic1", "Value")
+				if !ok {
+					log.Warningf("Received unknown data: %#v.", sig)
+					continue
+				}
+
+				valb, ok := val.([]byte)
+				if !ok {
+					log.Warningf("GattCharacteristic1’s value is not a []byte but %T: %#v.", val, val)
+					continue
+				}
+
+				ret <- valb
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
 
-	if err = char.StartNotify(); err != nil {
-		return fmt.Errorf("can't start notifications: %v", err)
-	}
-	log.Debugf("Started notifications for characteristic %v.", char)
-
-	defer func() {
-		log.Debugf("Stopping notifications")
-		warnOnError("can't stop notifications: %v", char.StopNotify())
-	}()
-
-	log.Infof("Listening for data")
-	<-ctx.Done()
-
-	return nil
-}
-
-// getTXCharacteristic retrieves the d’s UART TX characteristic if d.txc is non-nil and returns
-// it.
-func (d *device) getTXCharacteristic(ctx context.Context) (*btprofile.GattCharacteristic1, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if d.txc != nil {
-		return d.txc, nil
-	}
-
-	txc, err := d.getCharacteristic(ctx, txCharacteristic)
-	d.txc = txc
-	return txc, err
+	return ret, nil
 }
 
 // send writes data to d’s UART TX characteristic.
-func (d *device) send(ctx context.Context, data []uint8) error {
-	char, err := d.getTXCharacteristic(ctx)
+func (d *device) send(ctx context.Context, data []byte) error {
+	tx, err := d.getCharacteristic(ctx, txCharacteristic)
 	if err != nil {
 		return fmt.Errorf("can't get TX characteristic: %v", err)
 	}
 
-	if err := char.WriteValue(data, nil); err != nil {
+	if err := tx.WriteValue(data, nil); err != nil {
 		return fmt.Errorf("can't write to TX characteristic %q: %v", txCharacteristic, err)
 	}
 
@@ -244,7 +221,7 @@ func (d *device) send(ctx context.Context, data []uint8) error {
 
 // close disconnects d.
 func (d *device) close() error {
-	log.Debugf("Disconnecting from %q", d.addr)
+	log.Debugf("Disconnecting from %q.", d.addr)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	err := d.dev.Disconnect()

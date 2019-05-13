@@ -29,20 +29,58 @@ func warnOnError(errfmt string, args ...interface{}) {
 }
 
 func handleSend(ctx context.Context, d *device, args []string) error {
-	if len(args) < 2 {
+	if len(args) < 1 {
 		return errors.New("usage: send byte1 [byte2 [...]]")
 	}
 
 	data := make([]uint8, 0, len(args))
-	for i := 1; i < len(args); i++ {
-		b, err := strconv.ParseUint(args[i], 0, 8)
+	for i, arg := range args {
+		b, err := strconv.ParseUint(arg, 0, 8)
 		if err != nil {
-			return fmt.Errorf("can't convert args[%d]=%q to a uint8: %v", i, args[i], err)
+			return fmt.Errorf("can't convert args[%d]=%q to a uint8: %v", i, arg, err)
 		}
 		data = append(data, uint8(b))
 	}
 
 	return d.send(ctx, data)
+}
+
+func handleVersion(ctx context.Context, d *device, args []string) error {
+	if len(args) > 0 {
+		return errors.New("version does not take any arguments")
+	}
+	return d.send(ctx, []byte{0x5a, 0x14})
+}
+
+// receiveLoop connects to d, receives data from it until the context expires and prints the data.
+func receiveLoop(ctx context.Context, d *device) error {
+	if err := d.connect(ctx); err != nil {
+		return fmt.Errorf("can't connect to device: %v", err)
+	}
+
+	rc, err := d.receive(ctx)
+	if err != nil {
+		return fmt.Errorf("can't set up receiver: %v", err)
+	}
+
+	for {
+		select {
+		case bytes := <-rc:
+			if bytes == nil {
+				return io.EOF
+			}
+			data, err := unmarshalData(bytes)
+			if err != nil {
+				log.Errorf("Can't unmarshal %d received bytes (%#v): %v.", len(bytes), bytes, err)
+				continue
+			}
+
+			log.Noticef("Received data: %#v.", data)
+
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func main() {
@@ -51,37 +89,46 @@ func main() {
 
 	var err error
 
-	d := newDevice(*flagAddr)
-	defer func() { warnOnError("Can't close device: %v", d.close()) }()
+	// Set up device and TUI.
 
-	wrapDevice := func(hf func(context.Context, *device, []string) error) handlerFunc {
-		return func(args []string) error {
-			return hf(ctx, d, args)
-		}
-	}
+	d := newDevice(*flagAddr)
+	defer func() { warnOnError("Can't close device: %v.", d.close()) }()
 
 	h := map[string]handlerFunc{
-		"send": wrapDevice(handleSend),
+		"send":    handleSend,
+		"version": handleVersion,
 	}
 
-	t, err := newTUI(h)
+	t, err := newTUI(h, d)
 	if err != nil {
-		log.Errorf("Can't initialize TUI: %v", err)
+		log.Errorf("Can't initialize TUI: %v.", err)
 		return
 	}
-	defer func() { warnOnError("Can't close TUI: %v", t.close()) }()
+	defer func() { warnOnError("Can't close TUI: %v.", t.close()) }()
 
 	var wg sync.WaitGroup
-	for _, l := range []looper{t.loop, d.loop} {
-		wg.Add(1)
-		go func(ll looper) {
-			if err := ll(ctx); err != nil && err != io.EOF {
-				log.Errorf("Error during execution: %v", err)
-			}
-			cancel()
-			wg.Done()
-		}(l)
-	}
+
+	// TUI goroutine.
+	wg.Add(1)
+	go func() {
+		if err := t.loop(ctx); err != nil && err != io.EOF {
+			log.Errorf("Error processing terminal commands: %v.", err)
+		}
+
+		cancel()
+		wg.Done()
+	}()
+
+	// Device goroutine.
+	wg.Add(1)
+	go func() {
+		if err := receiveLoop(ctx, d); err != nil {
+			log.Errorf("Error receiving data: %v.", err)
+		}
+
+		cancel()
+		wg.Done()
+	}()
 
 	wg.Wait()
 }
