@@ -62,7 +62,7 @@ func callDissector(tvb *C.tvbuff_t, pinfo *C.packet_info, tree *C.proto_tree, da
 	if !ok {
 		panic(fmt.Sprintf("callDissector called for unknown dissector %v, *%v = %q", k, k, C.GoString((*C.char)(k))))
 	}
-	return C.int(d.Dissect(tvb, pinfo, &protoTree{tree}))
+	return C.int(d.Dissect(tvb, pinfo, (*protoTree)(tree)))
 }
 
 //export protoRegisterAll
@@ -112,13 +112,15 @@ func dissectorAddString(name, pattern string, d dissectorHandle) {
 	C.dissector_add_string(cn, cs, d)
 }
 
-type protoTree struct {
-	t *C.proto_tree
+type protoTree C.proto_tree
+
+func (t *protoTree) c() *C.proto_tree {
+	return (*C.proto_tree)(t)
 }
 
 func (t *protoTree) addProtocolF(hfindex protocol, tvb *C.tvbuff_t, start, length int, f string, a ...interface{}) *C.proto_item {
 	str := cstr(fmt.Sprintf(f, a...))
 	defer freestr(str)
 
-	return C.proto_tree_add_protocol_str(t.t, C.int(hfindex), tvb, C.int(start), C.int(length), str)
+	return C.proto_tree_add_protocol_str(t.c(), C.int(hfindex), tvb, C.int(start), C.int(length), str)
 }

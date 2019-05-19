@@ -32,6 +32,6 @@ func (d *sleeponDissector) ProtoRegHandoff() {
 }
 
 func (d *sleeponDissector) Dissect(tvb *C.tvbuff_t, pinfo *C.packet_info, tree *protoTree) int {
-	tree.addProtocolF(proto, tvb, 0, -1, "%T%v.Dissect(%#v, %#v, %#v)", d, d, tvb, pinfo)
+	tree.addProtocolF(proto, tvb, 0, -1, "%T%v.Dissect(%#v, %#v, %#v)", d, d, tvb, pinfo, tree)
 	return 0
 }
